@@ -1,0 +1,530 @@
+function wrap(value) {
+  return value === undefined ? [] : Array.isArray(value) ? value : [value];
+}
+
+function unwrap(arr) {
+  return arr.length <= 1 ? arr[0] : arr;
+}
+
+function arrayify(value) {
+  return value == null ? [] : typeof value !== 'string' && typeof value[Symbol.iterator] === 'function' ? Array.from(value) : [value];
+}
+
+function isIteratorLike(value) {
+  return value != null && typeof value.next === 'function';
+}
+
+function isPromiseLike(value) {
+  return value != null && typeof value.then === 'function';
+}
+
+class Element {
+  constructor(tag, props) {
+    this.tag = tag;
+    this.props = props;
+
+    this._node = undefined;
+    this._children = undefined;
+    this._ctx = undefined;
+    this._onvalues = undefined;
+    this._fallback = undefined;
+
+    // flags
+    this._isMounted = false;
+  }
+}
+
+export const Portal = Symbol.for('crank.Portal');
+
+export const Fragment = '';
+
+export function createElement(tag, props, ...children) {
+  props = Object.assign({}, props);
+  if (children.length === 1) {
+    props.children = children[0];
+  } else if (children.length > 1) {
+    props.children = children;
+  }
+
+  return new Element(tag, props);
+}
+
+function narrow(value) {
+  if (typeof value === 'boolean' || value == null) {
+    return undefined;
+  } else if (typeof value === 'string' || value instanceof Element) {
+    return value;
+  } else if (typeof value[Symbol.iterator] === 'function') {
+    return createElement(Fragment, null, value);
+  }
+
+  return value.toString();
+}
+
+function normalize(values) {
+  const values1 = [];
+  let buffer;
+  for (const value of values) {
+    if (!value) {
+      // pass
+    } else if (typeof value === 'string') {
+      buffer = (buffer || '') + value;
+    } else if (!Array.isArray(value)) {
+      if (buffer) {
+        values1.push(buffer);
+        buffer = undefined;
+      }
+
+      values1.push(value);
+    } else {
+      for (const value1 of value) {
+        if (!value1) {
+          // pass
+        } else if (typeof value1 === 'string') {
+          buffer = (buffer || '') + value1;
+        } else {
+          if (buffer) {
+            values1.push(buffer);
+            buffer = undefined;
+          }
+
+          values1.push(value1);
+        }
+      }
+    }
+  }
+
+  if (buffer) {
+    values1.push(buffer);
+  }
+
+  return values1;
+}
+
+function getValue(el) {
+  if (el._fallback) {
+    if (el._fallback instanceof Element) {
+      return getValue(el._fallback);
+    }
+
+    return el._fallback;
+  } else if (el.tag === Portal) {
+    return undefined;
+  } else if (typeof el.tag !== 'function' && el.tag !== Fragment) {
+    return el._node;
+  }
+
+  return unwrap(getChildValues(el));
+}
+
+function getChildValues(el) {
+  const values = [];
+  for (const child of wrap(el._children)) {
+    if (typeof child === 'string') {
+      values.push(child);
+    } else if (typeof child !== 'undefined') {
+      values.push(getValue(child));
+    }
+  }
+
+  return normalize(values);
+}
+
+export class Renderer {
+  constructor() {
+    this._cache = new WeakMap();
+  }
+
+  render(children, root) {
+    let portal = this._cache.get(root);
+    if (portal) {
+      portal.props = { root, children };
+    } else {
+      portal = createElement(Portal, { root, children });
+      this._cache.set(root, portal);
+    }
+
+    const result = update(this, portal, portal);
+    if (isPromiseLike(result)) {
+      return Promise.resolve(result).then(() => getChildValues(portal));
+    }
+
+    return getChildValues(portal);
+  }
+
+  create(el) {
+    return document.createElement(el.tag);
+  }
+
+  patch(el, node) {
+    for (let [name, value] of Object.entries(el.props)) {
+      if (name === 'children') {
+        continue;
+      } else if (name === 'class') {
+        name = 'className';
+      }
+
+      if (name in node) {
+        node[name] = value;
+      } else {
+        node.setAttribute(name, value);
+      }
+    }
+  }
+
+  arrange(el, node, children) {
+    let child = node.firstChild;
+    for (const newChild of children) {
+      if (child === newChild) {
+        child = child.nextSibling;
+      } else if (typeof newChild === 'string') {
+        if (child !== null && child.nodeType === Node.TEXT_NODE) {
+          child.nodeValue = newChild;
+          child = child.nextSibling;
+        } else {
+          node.insertBefore(document.createTextNode(newChild), child);
+        }
+      } else {
+        node.insertBefore(newChild, child);
+      }
+    }
+
+    while (child !== null) {
+      const nextSibling = child.nextSibling;
+      node.removeChild(child);
+      child = child.nextSibling;
+    }
+  }
+}
+
+function diff(renderer, host, oldChild, newChild) {
+  if (oldChild instanceof Element && newChild instanceof Element && oldChild.tag === newChild.tag) {
+    if (oldChild !== newChild) {
+      oldChild.props = newChild.props;
+      newChild = oldChild;
+    }
+  }
+
+  let value;
+  if (newChild instanceof Element) {
+    const initial = !newChild._isMounted;
+    value = update(renderer, host, newChild);
+    if (initial && isPromiseLike(value)) {
+      newChild._fallback = oldChild;
+    }
+  } else {
+    value = newChild;
+  }
+
+  return [newChild, value];
+}
+
+function update(renderer, host, el) {
+  if (el._isMounted) {
+    el = createElement(el, { ...el.props });
+  }
+
+  if (typeof el.tag === 'function') {
+    if (!el._ctx) {
+      el._ctx = new Context(renderer, host, el);
+    }
+
+    return updateCtx(el._ctx);
+  } else if (el.tag !== Fragment) {
+    host = el;
+  }
+
+  return updateChildren(renderer, host, el, el.props.children);
+}
+
+function updateChildren(renderer, host, el, newChildren) {
+  const oldChildren = wrap(el._children);
+  newChildren = arrayify(newChildren);
+  const children = [];
+  let values = [];
+  const length = Math.max(oldChildren.length, newChildren.length);
+  for (let i = 0; i < length; i++) {
+    const oldChild = oldChildren[i];
+    let newChild = narrow(newChildren[i]);
+    const [child, value] = diff(renderer, host, oldChild, newChild);
+    if (oldChild instanceof Element && child !== oldChild) {
+      unmount(renderer, oldChild);
+    }
+
+    children.push(child);
+    if (value) {
+      values.push(value);
+    }
+  }
+
+  el._children = unwrap(children);
+  if (values.some((value) => isPromiseLike(value))) {
+    values = Promise.all(values).finally(() => {
+      for (const oldChild of oldChildren.slice(length)) {
+        if (oldChild instanceof Element) {
+          unmount(renderer, oldChild);
+        }
+      }
+    });
+
+    let onvalues;
+    const nextValues = new Promise((resolve) => (onvalues = resolve));
+    values = Promise.race([values, nextValues]);
+    if (el._onvalues) {
+      el._onvalues(values);
+    }
+
+    el._onvalues = onvalues;
+    return values.then((values) => commit(renderer, el, normalize(values)));
+  }
+
+  for (const oldChild of oldChildren.slice(length)) {
+    if (oldChild instanceof Element) {
+      unmount(renderer, oldChild);
+    }
+  }
+
+  if (el._onvalues) {
+    el._onvalues(values);
+    el._onvalues = undefined;
+  }
+
+  return commit(renderer, el, normalize(values));
+}
+
+function commit(renderer, el, values) {
+  el._fallback = undefined;
+  if (typeof el.tag === 'function') {
+    return commitCtx(el._ctx, values);
+  } else if (el.tag === Fragment) {
+    return unwrap(values);
+  } else if (el.tag === Portal) {
+    renderer.arrange(el, el.props.root, values);
+    return undefined;
+  } else if (!el._node) {
+    el._node = renderer.create(el);
+  }
+
+  renderer.patch(el, el._node);
+  renderer.arrange(el, el._node, values);
+  return el._node;
+}
+
+function unmount(renderer, el) {
+  if (typeof el.tag === 'function') {
+    unmountCtx(el._ctx);
+  }
+
+  for (const child of wrap(el._children)) {
+    if (child instanceof Element) {
+      unmount(renderer, child);
+    }
+  }
+}
+
+class Context {
+  constructor(renderer, host, el) {
+    this._renderer = renderer;
+    this._host = host;
+    this._el = el;
+    this._iter = undefined;
+    this._schedules = new Set();
+    this._onavailable = undefined;
+    this._inflightBlock = undefined;
+    this._inflightValue = undefined;
+    this._enqueuedBlock = undefined;
+    this._enqueuedValue = undefined;
+    this._previousValue = undefined;
+
+    // flags
+    this._isUpdating = false;
+    this._isIterating = false;
+    this._isDone = false;
+    this._isAvailable = false;
+    this._isAsyncIterator = false;
+  }
+
+  refresh() {
+    resumeCtx(this);
+    return runCtx(this);
+  }
+
+  schedule(callback) {
+    this._schedules.add(callback);
+  }
+
+  *[Symbol.iterator]() {
+    while (!this._isDone) {
+      if (this._isIterating) {
+        throw new Error('Context iterated twice without a yield');
+      }
+
+      this._isIterating = true;
+      yield this._el.props;
+    }
+  }
+
+  async *[Symbol.asyncIterator]() {
+    do {
+      if (this._isIterating) {
+        throw new Error('Context iterated twice without a yield');
+      }
+
+      this._isIterating = true;
+      if (this._isAvailable) {
+        this._isAvailable = false;
+      } else {
+        await new Promise((resolve) => (this._onavailable = resolve));
+        if (this._unmounted) {
+          break;
+        }
+      }
+
+      yield this._el.props;
+    } while (!this._isUnmounted);
+  }
+}
+
+function stepCtx(ctx) {
+  let initial = !ctx._iter;
+  if (ctx._isDone) {
+    return getValue(ctx._el);
+  } else if (initial) {
+    const value = ctx._el.tag.call(ctx, ctx._el.props);
+    if (isIteratorLike(value)) {
+      ctx._iter = value;
+    } else if (isPromiseLike(value)) {
+      const block = Promise.resolve(value);
+      return [block, block.then((value) => updateCtxChildren(ctx, value))];
+    } else {
+      return [undefined, updateCtxChildren(ctx, value)];
+    }
+  }
+
+  let oldValue;
+  if (initial) {
+    // pass
+  } else if (ctx._isAsyncIterator && ctx._previousValue) {
+    oldValue = ctx._previousValue;
+  } else {
+    oldValue = getValue(ctx._el);
+  }
+
+  const iteration = ctx._iter.next(oldValue);
+  if (isPromiseLike(iteration)) {
+    if (initial) {
+      ctx._isAsyncIterator = true;
+    }
+
+    const block = iteration;
+    const value = iteration.then((iteration) => {
+      ctx._isIterating = false;
+      if (iteration.done) {
+        ctx._done = true;
+      }
+
+      return updateCtxChildren(ctx, iteration.value);
+    });
+
+    return [block, value];
+  }
+
+  ctx._isIterating = false;
+  if (iteration.done) {
+    ctx._isDone = true;
+  }
+
+  const value = updateCtxChildren(ctx, iteration.value);
+  return [value, value];
+}
+
+function advanceCtx(ctx) {
+  ctx._inflightBlock = ctx._enqueuedBlock;
+  ctx._inflightValue = ctx._enqueuedValue;
+  ctx._enqueuedBlock = undefined;
+  ctx._enqueuedValue = undefined;
+  if (ctx._isAsyncIterator) {
+    runCtx(ctx);
+  }
+}
+
+function runCtx(ctx) {
+  if (!ctx._inflightBlock) {
+    let [block, value] = stepCtx(ctx);
+    if (isPromiseLike(block)) {
+      block = block.finally(() => advanceCtx(ctx));
+      ctx._inflightBlock = block;
+    }
+
+    if (isPromiseLike(value)) {
+      ctx._inflightValue = value;
+      ctx._previousValue = value;
+    }
+
+    return value;
+  } else if (ctx._isAsyncIterator) {
+    return ctx._inflightValue;
+  } else if (!ctx._enqueuedBlock) {
+    let resolve;
+    ctx._enqueuedBlock = ctx._inflightBlock
+      .then(() => {
+        const [block, value] = stepCtx(ctx);
+        resolve(value);
+        if (isPromiseLike(value)) {
+          ctx._previousValue = value;
+        }
+
+        return block;
+      })
+      .finally(() => advanceCtx(ctx));
+    ctx._enqueuedValue = new Promise((resolve1) => (resolve = resolve1));
+  }
+
+  return ctx._enqueuedValue;
+}
+
+function resumeCtx(ctx) {
+  if (ctx._onavailable) {
+    ctx._onavailable();
+    ctx._onavailable = undefined;
+  } else if (!ctx._isAvailable) {
+    ctx._isAvailable = true;
+  }
+}
+
+function updateCtx(ctx) {
+  ctx._isUpdating = true;
+  resumeCtx(ctx);
+  return runCtx(ctx);
+}
+
+function updateCtxChildren(ctx, children) {
+  return updateChildren(ctx._renderer, ctx._host, ctx._el, narrow(children));
+}
+
+function commitCtx(ctx, values) {
+  ctx._previousValue = undefined;
+  if (!ctx._isUpdating) {
+    ctx._renderer.arrange(ctx._host, ctx._host.tag === Portal ? ctx._host.props.root : ctx._host._node, getChildValues(ctx._host));
+  }
+
+  const value = unwrap(values);
+  const schedules = Array.from(ctx._schedules);
+  ctx._schedules.clear();
+  for (const schedule of schedules) {
+    schedule(value);
+  }
+
+  ctx._isUpdating = false;
+  return value;
+}
+
+function unmountCtx(ctx) {
+  if (!ctx._isDone) {
+    ctx._isDone = true;
+    resumeCtx(ctx);
+    if (ctx._iterator && typeof ctx._iterator.return === 'function') {
+      ctx._iterator.return();
+    }
+  }
+}
